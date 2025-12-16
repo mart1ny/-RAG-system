@@ -1,0 +1,4 @@
+psycopg[binary]==3.1.18
+pymongo==4.7.3
+redis==5.0.7
+qdrant-client==1.9.0
