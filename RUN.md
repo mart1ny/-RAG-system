@@ -32,6 +32,37 @@ python -m scripts.ingest
 python -m scripts.search "пайплайн RAG"
 ```
 
+## Поднятие API и фронта
+
+1. **Backend-API (FastAPI + Uvicorn)**  
+   ```bash
+   source .venv/bin/activate
+   pip install -r requirements.txt  # если ещё не поставлены зависимости
+   CHAT_CHUNK_LIMIT=6 uvicorn scripts.api:app --reload --host 0.0.0.0 --port 8000
+   ```
+   API переиспользует подключение к Postgres/Qdrant, поэтому убедись, что инфраструктура и данные уже подняты/загружены.
+   Переменная `CHAT_CHUNK_LIMIT` отвечает за количество фрагментов, которые вытягиваются и попадают в ответ (по умолчанию 6, можно увеличить до 8).
+
+2. **Frontend (Vite + React)**  
+   ```bash
+   cd frontend
+   npm install
+   VITE_CHUNK_LIMIT=6 npm run dev
+   ```
+   По умолчанию UI ходит в `http://localhost:8000`. Чтобы указать другой адрес, прокинь переменную `VITE_API_URL`, например:
+   ```bash
+   VITE_API_URL="http://localhost:8080" npm run dev
+   ```
+
+3. **Продакшн-сборка фронта**  
+   ```bash
+   cd frontend
+   npm run build
+   npm run preview   # опционально посмотреть статическую сборку
+   ```
+
+После запуска `uvicorn …` и `npm run dev` открой `http://localhost:5173` и используй чат в интерфейсе, похожем на GPT: есть переключатель темы, подсветка источников и быстрая кнопка с примером запроса.
+
 ## Частые проблемы
 
 - **`permission denied for table assignments`**  
