@@ -18,9 +18,27 @@ type SourceChunk = {
   score: number;
 };
 
+type GraphNode = {
+  topic: string;
+  label: string;
+  assignments: string[];
+  primary: boolean;
+};
+
+type GraphEdge = {
+  source: string;
+  target: string;
+};
+
+type GraphContext = {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+};
+
 type ChatResponse = {
   answer: string;
   sources: SourceChunk[];
+  graph?: GraphContext | null;
 };
 
 const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
@@ -42,6 +60,7 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [sources, setSources] = useState<SourceChunk[]>([]);
+  const [graph, setGraph] = useState<GraphContext | null>(null);
   const [examples, setExamples] = useState<string[]>([]);
   const [theme, setTheme] = useState<Theme>(() => (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"));
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
@@ -95,8 +114,10 @@ function App() {
       const assistantMessage: ChatMessage = { id: createId(), role: "assistant", text: payload.answer };
       setMessages((prev) => [...prev, assistantMessage]);
       setSources(payload.sources);
+      setGraph(payload.graph ?? null);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Сервис временно недоступен");
+      setGraph(null);
     } finally {
       setLoading(false);
     }
@@ -175,6 +196,30 @@ function App() {
         <aside className="context">
           <h2>Контекст</h2>
           <p>Каждый ответ собирается из найденных кусков векторного поиска.</p>
+          {graph && graph.nodes.length > 0 && (
+            <section className="graph">
+              <h3>Граф тем</h3>
+              <div className="graph__nodes">
+                {graph.nodes.map((node) => (
+                  <div key={node.topic} className={`graph__node${node.primary ? " graph__node--primary" : ""}`}>
+                    <span className="graph__label">{node.label}</span>
+                    {node.assignments.length > 0 && <small>{node.assignments.join(", ")}</small>}
+                  </div>
+                ))}
+              </div>
+              {graph.edges.length > 0 && (
+                <div className="graph__edges">
+                  {graph.edges.map((edge) => (
+                    <div key={`${edge.source}-${edge.target}`} className="graph__edge">
+                      <span>{edge.source}</span>
+                      <span className="graph__arrow">⟶</span>
+                      <span>{edge.target}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </section>
+          )}
           <div className="context__list">
             {sources.length === 0 && <p>Пока нет подобранных материалов. Задай вопрос, чтобы увидеть фрагменты.</p>}
             {sources.map((source) => (

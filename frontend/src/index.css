@@ -251,6 +251,54 @@ body {
   gap: 12px;
 }
 
+.graph {
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+  padding: 12px;
+  margin-bottom: 12px;
+}
+
+.graph h3 {
+  margin: 0 0 8px 0;
+}
+
+.graph__nodes {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.graph__node {
+  padding: 8px 10px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--card);
+  display: flex;
+  flex-direction: column;
+}
+
+.graph__node--primary {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent) inset;
+}
+
+.graph__label {
+  font-weight: 600;
+}
+
+.graph__edge {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.9rem;
+  color: var(--muted);
+  padding: 2px 0;
+}
+
+.graph__arrow {
+  color: var(--accent);
+}
+
 .context__card {
   border-radius: var(--radius);
   border: 1px solid var(--border);
