@@ -38,6 +38,7 @@ python -m scripts.search "пайплайн RAG"
    ```bash
    source .venv/bin/activate
    pip install -r requirements.txt  # если ещё не поставлены зависимости
+   cp .env.example .env             # один раз, затем подставь путь к GGUF и при необходимости параметры Neo4j
    CHAT_CHUNK_LIMIT=6 uvicorn scripts.api:app --reload --host 0.0.0.0 --port 8000
    ```
    API переиспользует подключение к Postgres/Qdrant, поэтому убедись, что инфраструктура и данные уже подняты/загружены.
@@ -62,6 +63,30 @@ python -m scripts.search "пайплайн RAG"
    ```
 
 После запуска `uvicorn …` и `npm run dev` открой `http://localhost:5173` и используй чат в интерфейсе, похожем на GPT: есть переключатель темы, подсветка источников и быстрая кнопка с примером запроса.
+
+## Настройка локальных эмбеддингов и LLM
+
+### Эмбеддинги (sentence-transformers)
+
+В `.env` по умолчанию прописан `EMBEDDING_PROVIDER=huggingface` и модель `sentence-transformers/all-MiniLM-L6-v2`. Если хочешь другую модель:
+
+```bash
+vim .env  # или любой редактор
+# поменяй EMBEDDING_DIM и HUGGINGFACE_EMBEDDING_MODEL
+python -m scripts.ingest  # пересоздаст коллекцию под новую размерность
+```
+
+Если модель не подтянулась или что-то сломалось, скрипты автоматически откатятся на `fake_embed`, так что интерфейс продолжит отвечать.
+
+### Локальная LLM (llama.cpp)
+
+```bash
+mkdir -p models
+curl -L -o models/phi-3-mini-4k-instruct-q4.gguf \
+  https://huggingface.co/microsoft/Phi-3-mini-4k-instruct-gguf/resolve/main/Phi-3-mini-4k-instruct-q4.gguf
+```
+
+Пропиши путь к файлу в `.env` (`LLAMA_MODEL_PATH`) и перезапусти `uvicorn`. Если модель не загрузится, backend автоматически вернётся к Markdown-ответам.
 
 ## Частые проблемы
 

@@ -16,8 +16,9 @@
 
 - **RAG-пайплайн**: документы попадают в MongoDB/Qdrant, а метаданные — в Postgres; Redis стримит события, готовые к векторизации.
 - **Стек хранилищ**: Postgres, MongoDB, Redis, Qdrant и опционально Neo4j (граф зависимостей курса).
-- **FastAPI-чулок**: минимальный backend (`scripts/api.py`) переиспользует `fake_embed`, делает семплированный поиск и формирует структурированный Markdown-ответ.
-- **Фронтенд**: Vite + React интерфейс с двумя темами, подсветкой источников, кнопками примеров и Markdown-рендером ответов.
+- **FastAPI-чулок**: минимальный backend (`scripts/api.py`) переиспользует `embed_text`, делает retrieval и формирует структурированный Markdown-ответ. При включённом LLM-провайдере генерирует текст локальной моделью (llama.cpp).
+- **Фронтенд**: Vite + React интерфейс с двумя темами, подсветкой источников, кнопками примеров и Markdown-рендером ответов плюс мини-граф тем на основе Neo4j.
+- **Локальные эмбеддинги**: по умолчанию используется `sentence-transformers/all-MiniLM-L6-v2`, можно поменять модель в `.env`.
 - **Docker first**: вся инфраструктура описана в `docker-compose.yml` и запускается одной командой, никакой ручной установки PostgreSQL.
 
 ---
@@ -34,7 +35,7 @@ flowchart TD
         A --> E[Redis Streams]
     end
     subgraph RAG API
-        F[FastAPI /scripts/api.py] -->|fake_embed| D
+        F[FastAPI /scripts/api.py] -->|embed_text| D
         F -->|joins| B
         F -->|sample prompts| UI
     end
@@ -62,10 +63,10 @@ flowchart TD
 ### Поток запроса (RAG)
 
 1. Пользователь вводит вопрос во фронте → `/api/chat`.
-2. FastAPI эмбеддит запрос через `fake_embed`, бьёт его по Qdrant (COSINE).
+2. FastAPI эмбеддит запрос через выбранную модель (`sentence-transformers` по умолчанию) и ищет в Qdrant (COSINE).
 3. По `document_id` подтягивает заголовок и chunk из PostgreSQL.
 4. Собирает Markdown-ответ: секция с основными находками, затем нумерованный список источников с цитатами.
-5. UI рендерит ответ (ReactMarkdown), параллельно показывает карточки контекста справа.
+5. UI рендерит ответ (либо Markdown, либо текст от локальной LLM) и мини-граф Neo4j с соседними темами.
 
 ---
 
@@ -87,6 +88,13 @@ flowchart TD
 
 ## Быстрый старт
 
+0. **Скопируй .env**  
+   ```bash
+   cp .env.example .env
+   # отредактируй значения OPENAI_API_KEY, EMBEDDING_PROVIDER и т.д.
+   ```
+   Backend автоматически читает `.env` (через `python-dotenv`), поэтому достаточно добавить ключи и переменные в этот файл.
+
 1. **Подними инфраструктуру**
    ```bash
    docker compose up -d
@@ -104,7 +112,7 @@ flowchart TD
    ```bash
    python -m scripts.ingest
    ```
-   Скрипт создаст записи в Postgres, документы в Mongo, векторы в Qdrant и события в Redis Streams. На выходе увидишь `Inserted <n> chunks...`.
+   Скрипт создаст записи в Postgres, документы в Mongo, векторы в Qdrant, связи в Neo4j и события в Redis Streams. На выходе увидишь `Inserted <n> chunks...`.
 
 4. **Проверь поиск из CLI**
    ```bash
@@ -124,6 +132,49 @@ flowchart TD
    Открой `http://localhost:5173` и задай вопрос — ассистент ответит структурированным Markdown и покажет источники.
 
 Все команды с доп. комментариями — в [`RUN.md`](RUN.md).
+
+---
+
+## Настройка эмбеддингов и LLM
+
+### Эмбеддинги (sentence-transformers)
+
+Проект из коробки использует локальные sentence-transformers. Всё, что нужно:
+
+```bash
+pip install -r requirements.txt               # подтянет sentence-transformers
+cp .env.example .env                          # если ещё не сделал
+
+# в .env
+EMBEDDING_PROVIDER=huggingface
+EMBEDDING_DIM=384                             # для all-MiniLM-L6-v2
+HUGGINGFACE_EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
+
+python -m scripts.ingest                      # пересоздаём коллекцию Qdrant
+```
+
+Теперь `embed_text` использует локальную модель (CPU/Metal). Можно подставить другую модель из HuggingFace Hub — просто поменяй `HUGGINGFACE_EMBEDDING_MODEL` и `EMBEDDING_DIM`. Если модель недоступна, сервис откатится на детерминированные `fake_embed`, чтобы запросы не падали.
+
+### Локальная LLM (llama.cpp)
+
+Чтобы ответы были ближе к GPT:
+
+1. Скачай GGUF-модель (пример):  
+   ```bash
+   mkdir -p models
+   curl -L -o models/phi-3-mini-4k-instruct-q4.gguf \
+     https://huggingface.co/microsoft/Phi-3-mini-4k-instruct-gguf/resolve/main/Phi-3-mini-4k-instruct-q4.gguf
+   ```
+2. В `.env` пропиши:
+   ```
+   LLM_PROVIDER=llama
+   LLAMA_MODEL_PATH=./models/phi-3-mini-4k-instruct-q4.gguf
+   LLAMA_THREADS=6             # подбери под свою машину
+   LLAMA_GPU_LAYERS=0          # оставь 0, если запускаешь на CPU
+   ```
+3. Перезапусти API: `CHAT_CHUNK_LIMIT=6 uvicorn scripts.api:app --reload ...`
+
+Теперь `_build_llm_answer` вызывает локальную модель через `llama-cpp-python`. Если LLM не загрузилась или вышла ошибка, backend автоматически возвращается к Markdown-фоллбеку.
 
 ---
 
@@ -148,7 +199,17 @@ flowchart TD
 | `REDIS_URL`       | `redis://localhost:6379/0`                    | Redis Streams/кеш.                        |
 | `QDRANT_HOST/PORT`| `localhost` / `6333`                          | Хост/порт Qdrant.                         |
 | `QDRANT_COLLECTION` | `course_materials`                         | Коллекция векторов.                       |
-| `EMBEDDING_DIM`   | `384`                                         | Размерность `fake_embed`.                 |
+| `EMBEDDING_DIM`   | `384`                                         | Размерность эмбеддингов (совпадает с провайдером). |
+| `EMBEDDING_PROVIDER` | `huggingface`                              | `huggingface` или `fake`.                 |
+| `HUGGINGFACE_EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | Модель sentence-transformers.        |
+| `NEO4J_URI` / `NEO4J_USER` / `NEO4J_PASSWORD` | `bolt://localhost:7687` / `neo4j` / `neo4jpass` | Подключение к графу тем. |
+| `LLM_PROVIDER`    | `llama`                                      | `llama` или `local` (Markdown fallback). |
+| `LLAMA_MODEL_PATH`| `./models/phi-3-mini-4k-instruct-q4.gguf`    | Путь к GGUF-модели.                      |
+| `LLAMA_CTX_SIZE`  | `4096`                                       | Контекстное окно для llama.cpp.          |
+| `LLAMA_THREADS`   | `4`                                          | Количество потоков CPU.                  |
+| `LLAMA_GPU_LAYERS`| `0`                                          | Слои на GPU (оставь 0 при CPU-режиме).   |
+| `LLAMA_MAX_TOKENS`| `512`                                        | Ограничение генерации для LLM.           |
+| `LLAMA_TEMPERATURE` | `0.2`                                      | Температура генерации.                   |
 | `INGEST_STREAM`   | `stream:ingest`                               | Ключ для Redis Streams.                   |
 | `CHAT_CHUNK_LIMIT`| `6`                                           | Сколько контекстов подтягивает API (до 8).|
 | `VITE_API_URL`    | `http://localhost:8000`                       | Endpoint backend’a для фронта.            |
@@ -168,6 +229,7 @@ flowchart TD
 ## Идеи для развития
 
 - Подключить настоящий провайдер эмбеддингов/LLM вместо `fake_embed`.
+- Задействовать SSE/WebSocket для «живых» ответов или расширить графовую визуализацию (например, мини-карту зависимостей).
 - Добавить авторизацию и профили студентов, чтобы персонализировать подсказки.
 - Стримить частичные ответы в UI через Server-Sent Events/WebSocket.
 - Встроить Neo4j-граф в ответ (например, подсвечивать prerequisite-концепции).
