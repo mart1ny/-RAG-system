@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import uuid
+import contextlib
 from pathlib import Path
 from typing import Iterable
 
@@ -20,9 +21,10 @@ from redis import Redis
 from scripts.common import (
     EMBEDDING_DIM,
     QDRANT_COLLECTION,
-    fake_embed,
+    embed_text,
     get_pg_connection,
     get_qdrant_client,
+    get_neo4j_driver,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,18 +32,62 @@ DATA_PATH = ROOT / "data" / "materials.json"
 
 
 def ensure_collection(client: QdrantClient) -> None:
-    try:
-        client.get_collection(QDRANT_COLLECTION)
-    except qexc.UnexpectedResponse:
+    def recreate():
         client.recreate_collection(
             collection_name=QDRANT_COLLECTION,
             vectors_config=VectorParams(size=EMBEDDING_DIM, distance=Distance.COSINE),
         )
 
+    try:
+        collection = client.get_collection(QDRANT_COLLECTION)
+        current_vectors = getattr(collection.config.params, "vectors", None)
+        current_size = getattr(current_vectors, "size", None) if current_vectors else None
+        if current_size != EMBEDDING_DIM:
+            print(
+                f"[info] Recreating Qdrant collection '{QDRANT_COLLECTION}' "
+                f"to match vector size {EMBEDDING_DIM} (was {current_size})."
+            )
+            recreate()
+    except qexc.UnexpectedResponse:
+        recreate()
+
 
 def load_materials(path: Path = DATA_PATH) -> Iterable[dict]:
     with path.open(encoding="utf-8") as fh:
         return json.load(fh)
+
+
+def _upsert_assignment_graph(tx, assignment_id: str, title: str, topic: str | None) -> None:
+    if not topic:
+        return
+    tx.run(
+        """
+        MERGE (a:Assignment {id: $id})
+        SET a.title = $title, a.topic = $topic
+        WITH a
+        MERGE (c:Concept {id: $topic})
+        SET c.name = $topic
+        MERGE (a)-[:ASSOCIATED_WITH]->(c)
+        """,
+        id=assignment_id,
+        title=title,
+        topic=topic,
+    )
+
+
+def _link_concepts(tx, left_topic: str | None, right_topic: str | None) -> None:
+    if not left_topic or not right_topic:
+        return
+    tx.run(
+        """
+        MERGE (c1:Concept {id: $left})
+        MERGE (c2:Concept {id: $right})
+        MERGE (c1)-[:RELATES_TO]->(c2)
+        MERGE (c2)-[:RELATES_TO]->(c1)
+        """,
+        left=left_topic,
+        right=right_topic,
+    )
 
 
 def main() -> None:
@@ -53,12 +99,20 @@ def main() -> None:
     qdrant = get_qdrant_client()
 
     ensure_collection(qdrant)
+    try:
+        neo4j_driver = get_neo4j_driver()
+    except Exception as exc:  # pragma: no cover
+        print(f"[warning] Neo4j unavailable ({exc}). Skipping graph enrichment.")
+        neo4j_driver = None
+    previous_topic: str | None = None
 
     inserted = 0
     stream_key = os.getenv("INGEST_STREAM", "stream:ingest")
     mongo_collection = mongo["rag"]["materials"]
 
-    with pg_conn.cursor() as cur:
+    neo_session_context = neo4j_driver.session() if neo4j_driver else contextlib.nullcontext()
+
+    with pg_conn.cursor() as cur, neo_session_context as neo_session:
         for item in materials:
             assignment_id = uuid.uuid4()
             cur.execute(
@@ -93,7 +147,7 @@ def main() -> None:
                 )
                 document_id = cur.fetchone()[0]
                 point_id = str(uuid.uuid4())
-                vector = fake_embed(chunk)
+                vector = embed_text(chunk)
 
                 qdrant.upsert(
                     collection_name=QDRANT_COLLECTION,
@@ -130,6 +184,23 @@ def main() -> None:
                 )
 
                 inserted += 1
+
+            if neo_session:
+                neo_session.execute_write(
+                    _upsert_assignment_graph,
+                    str(assignment_id),
+                    item["title"],
+                    item.get("topic"),
+                )
+
+                if previous_topic and previous_topic != item.get("topic"):
+                    neo_session.execute_write(
+                        _link_concepts,
+                        previous_topic,
+                        item.get("topic"),
+                    )
+
+            previous_topic = item.get("topic")
 
     print(f"Inserted {inserted} chunks into Qdrant collection '{QDRANT_COLLECTION}'.")
 

@@ -8,13 +8,20 @@ from __future__ import annotations
 import os
 import textwrap
 import uuid
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Set, Dict
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from scripts.common import QDRANT_COLLECTION, fake_embed, get_pg_connection, get_qdrant_client
+from scripts.common import (
+    QDRANT_COLLECTION,
+    chat_completion,
+    embed_text,
+    get_pg_connection,
+    get_qdrant_client,
+    get_neo4j_driver,
+)
 
 app = FastAPI(title="RAG Learning Tasks Assistant", version="0.1.0")
 
@@ -31,6 +38,23 @@ EXAMPLE_PROMPTS = [
     "Как подготовиться к пайплайну RAG для курса?",
     "Что включает граф знаний для тем по машинному обучению?",
     "Как лучше объяснить студенту векторное хранилище?",
+]
+
+SYSTEM_PROMPT = (
+    "Ты — RAG-ассистент для учебного курса. Отвечай структурированно, с шагами и ссылками на источники, "
+    "используя только предоставленный контекст. В конце добавляй короткое приглашение задать уточняющие вопросы."
+)
+
+FEW_SHOT_EXAMPLES = [
+    {
+        "question": "Как объяснить студенту пайплайн RAG?",
+        "context": "- intro_01.md: RAG совмещает поиск и генерацию.\n- pipeline.md: этапы ingestion → embeddings → retrieval → генерация.",
+        "answer": (
+            "1. Напоминаем, что RAG = поиск + LLM, поэтому заранее готовим базу знаний.\n"
+            "2. Подчёркиваем необходимость пайплайна ingestion (сбор, чистка, чанкинг) — иначе вектора будут шумными.\n"
+            "3. После векторизации в Qdrant отвечаем за быстрый поиск и добавляем контекст в промпт перед генерацией."
+        ),
+    },
 ]
 
 
@@ -56,11 +80,29 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     answer: str
     sources: List[SourceChunk]
+    graph: Optional["GraphContext"] = None
+
+
+class GraphNode(BaseModel):
+    topic: str
+    label: str
+    assignments: List[str]
+    primary: bool
+
+
+class GraphEdge(BaseModel):
+    source: str
+    target: str
+
+
+class GraphContext(BaseModel):
+    nodes: List[GraphNode]
+    edges: List[GraphEdge]
 
 
 def _search_hits(query: str, limit: int) -> List:
     client = get_qdrant_client()
-    vector = fake_embed(query)
+    vector = embed_text(query)
     return client.search(
         collection_name=QDRANT_COLLECTION,
         query_vector=vector,
@@ -162,7 +204,18 @@ def _build_answer(prompt: str, sources: List[SourceChunk]) -> str:
     else:
         summary_section.append("- Материалы подтверждают базовые определения и шаги RAG.")
 
-    detail_lines = ["#### Использованные фрагменты", ""]
+    outro = (
+        "#### Что дальше?\n"
+        "Если нужен пошаговый план или хочется раскрыть конкретный шаг, задай уточняющий вопрос — "
+        "я подберу дополнительные материалы."
+    )
+
+    sections = [intro, "", *summary_section, "", _format_context_section(sources), "", outro]
+    return "\n".join(sections)
+
+
+def _format_context_section(sources: List[SourceChunk]) -> str:
+    lines = ["#### Использованные фрагменты", ""]
     for idx, src in enumerate(sources, start=1):
         meta_parts = [src.assignment_title]
         if src.topic:
@@ -177,16 +230,126 @@ def _build_answer(prompt: str, sources: List[SourceChunk]) -> str:
                > {src.content.strip()}
             """
         ).strip()
-        detail_lines.append(bullet)
+        lines.append(bullet)
+    return "\n".join(lines)
 
+
+def _build_graph_context(topics: Set[str]) -> Optional[GraphContext]:
+    if not topics:
+        return None
+
+    try:
+        driver = get_neo4j_driver()
+    except Exception as exc:  # pragma: no cover
+        print(f"[warning] Neo4j driver unavailable ({exc})")
+        return None
+
+    nodes: Dict[str, GraphNode] = {}
+    edges: List[GraphEdge] = []
+    edge_seen: Set[str] = set()
+
+    with driver.session() as session:
+        edge_records = session.run(
+            """
+            MATCH (c:Concept)-[:RELATES_TO]->(n:Concept)
+            WHERE c.id IN $topics
+            RETURN c.id AS source, c.name AS source_name, n.id AS target, n.name AS target_name
+            LIMIT $limit
+            """,
+            topics=list(topics),
+            limit=40,
+        )
+        for record in edge_records:
+            source = record["source"]
+            target = record["target"]
+            if not source or not target:
+                continue
+            source_label = record["source_name"] or source
+            target_label = record["target_name"] or target
+            nodes.setdefault(
+                source,
+                GraphNode(topic=source, label=source_label, assignments=[], primary=source in topics),
+            )
+            nodes.setdefault(
+                target,
+                GraphNode(topic=target, label=target_label, assignments=[], primary=target in topics),
+            )
+            key = f"{source}->{target}"
+            if key not in edge_seen:
+                edges.append(GraphEdge(source=source, target=target))
+                edge_seen.add(key)
+
+        node_ids = list(nodes.keys() | set(topics))
+        if node_ids:
+            assignment_records = session.run(
+                """
+                MATCH (c:Concept)<-[:ASSOCIATED_WITH]-(a:Assignment)
+                WHERE c.id IN $topics
+                RETURN c.id AS topic, collect(a.title)[0..3] AS titles
+                """,
+                topics=node_ids,
+            )
+            for record in assignment_records:
+                topic = record["topic"]
+                titles = record["titles"] or []
+                label = topic
+                node = nodes.setdefault(
+                    topic,
+                    GraphNode(topic=topic, label=label, assignments=[], primary=topic in topics),
+                )
+                node.assignments = list(titles)
+
+    if not nodes:
+        return None
+
+    return GraphContext(nodes=list(nodes.values()), edges=edges)
+
+
+def _build_llm_answer(prompt: str, sources: List[SourceChunk]) -> Optional[str]:
+    if not sources:
+        return None
+
+    context_lines: list[str] = []
+    for idx, src in enumerate(sources, start=1):
+        fragment = textwrap.shorten(src.content.strip(), width=500, placeholder="…")
+        topic = f" · {src.topic}" if src.topic else ""
+        source = f" ({src.source}, chunk #{src.chunk_number})" if src.source else ""
+        context_lines.append(f"{idx}. {src.assignment_title}{topic}{source}: {fragment}")
+
+    context_blob = "\n".join(context_lines)
+
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    for example in FEW_SHOT_EXAMPLES:
+        messages.append(
+            {
+                "role": "user",
+                "content": f"Вопрос: {example['question']}\nКонтекст:\n{example['context']}",
+            }
+        )
+        messages.append({"role": "assistant", "content": example["answer"]})
+
+    messages.append(
+        {
+            "role": "user",
+            "content": (
+                f"Вопрос: {prompt}\n"
+                f"Контекст:\n{context_blob}\n\n"
+                "Ответь по шагам, выдели ключевые идеи маркдаун-списками и упомяни источники в скобках."
+            ),
+        }
+    )
+
+    llm_output = chat_completion(messages)
+    if not llm_output:
+        return None
+
+    context_section = _format_context_section(sources)
     outro = (
-        "#### Что дальше?\n"
+        "\n\n#### Что дальше?\n"
         "Если нужен пошаговый план или хочется раскрыть конкретный шаг, задай уточняющий вопрос — "
         "я подберу дополнительные материалы."
     )
-
-    sections = [intro, "", *summary_section, "", *detail_lines, "", outro]
-    return "\n".join(sections)
+    return f"{llm_output}\n\n{context_section}{outro}"
 
 
 @app.get("/healthz")
@@ -209,5 +372,9 @@ def chat(req: ChatRequest) -> ChatResponse:
     if not sources:
         raise HTTPException(status_code=404, detail="Не удалось сопоставить документы в Postgres.")
 
-    answer = _build_answer(req.message, sources)
-    return ChatResponse(answer=answer, sources=sources)
+    topics = {src.topic for src in sources if src.topic}
+    graph_context = _build_graph_context(topics)
+
+    llm_answer = _build_llm_answer(req.message, sources)
+    answer = llm_answer or _build_answer(req.message, sources)
+    return ChatResponse(answer=answer, sources=sources, graph=graph_context)
